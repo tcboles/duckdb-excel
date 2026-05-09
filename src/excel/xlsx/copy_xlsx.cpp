@@ -6,7 +6,10 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "xlsx/read_xlsx.hpp"
+#include "xlsx/xlsx_appender.hpp"
 #include "xlsx/xlsx_writer.hpp"
+
+#include "duckdb/common/file_system.hpp"
 
 namespace duckdb {
 
@@ -86,7 +89,10 @@ struct WriteXLSXData final : TableFunctionData {
 	string sheet_name;
 	idx_t sheet_row_limit;
 	bool header;
+	bool append = false;
+	bool replace = false;
 };
+
 
 static void ParseCopyToOptions(const unique_ptr<WriteXLSXData> &data,
                                const case_insensitive_map_t<vector<Value>> &options) {
@@ -144,6 +150,31 @@ static void ParseCopyToOptions(const unique_ptr<WriteXLSXData> &data,
 	} else {
 		data->sheet_row_limit = XLSX_MAX_CELL_ROWS;
 	}
+
+	// MODE option: 'create' (default), 'append', or 'replace'
+	const auto mode_opt = options.find("mode");
+	if (mode_opt != options.end()) {
+		if (mode_opt->second.size() != 1) {
+			throw BinderException("MODE option must be a single string value ('create', 'append', or 'replace')");
+		}
+		const auto &mode_val = mode_opt->second.back();
+		if (mode_val.IsNull() || mode_val.type() != LogicalType::VARCHAR) {
+			throw BinderException("MODE option must be a single string value ('create', 'append', or 'replace')");
+		}
+		const auto mode_str = StringUtil::Lower(StringValue::Get(mode_val));
+		if (mode_str == "create") {
+			data->append = false;
+			data->replace = false;
+		} else if (mode_str == "append") {
+			data->append = true;
+			data->replace = false;
+		} else if (mode_str == "replace") {
+			data->append = false;
+			data->replace = true;
+		} else {
+			throw BinderException("Invalid MODE '%s' — expected 'create', 'append', or 'replace'", mode_str);
+		}
+	}
 }
 
 static unique_ptr<FunctionData> Bind(ClientContext &context, CopyFunctionBindInput &input, const vector<string> &names,
@@ -165,13 +196,32 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, CopyFunctionBindInp
 //------------------------------------------------------------------------------
 struct GlobalWriteXLSXData final : public GlobalFunctionData {
 
-	XLXSWriter writer;
+	// Exactly one of these is set after construction.
+	unique_ptr<XLXSWriter> fresh_writer;
+	unique_ptr<XLSXAppender> appender;
+
 	DataChunk cast_chunk;
 	ExpressionExecutor executor;
 	vector<unique_ptr<Expression>> conversion_expressions;
 
 	GlobalWriteXLSXData(ClientContext &context, const string &file_path, const WriteXLSXData &data)
-	    : writer(context, file_path, data.sheet_row_limit), executor(context) {
+	    : executor(context) {
+
+		// DuckDB's COPY framework hands us a temp file path (`file_path`) that it will atomically
+		// rename onto the user's target (`data.file_path`) after Finalize. The user-visible path
+		// may contain `~` etc, so expand it before checking existence; the framework already
+		// expands the temp path it hands us.
+		auto &fs = FileSystem::GetFileSystem(context);
+		const auto target_path = fs.ExpandPath(data.file_path);
+		const bool target_exists = fs.FileExists(target_path);
+		const bool use_appender = (data.append || data.replace) && target_exists;
+
+		if (use_appender) {
+			appender = make_uniq<XLSXAppender>(context, target_path, file_path, data.sheet_name, data.replace,
+			                                   data.sheet_row_limit);
+		} else {
+			fresh_writer = make_uniq<XLXSWriter>(context, file_path, data.sheet_row_limit);
+		}
 
 		// Initialize the expression executor
 		for (idx_t col_idx = 0; col_idx < data.column_types.size(); col_idx++) {
@@ -216,23 +266,103 @@ struct GlobalWriteXLSXData final : public GlobalFunctionData {
 	}
 };
 
+// Tiny dispatch helpers so Sink can stay readable without an interface.
+namespace {
+struct SinkOps {
+	GlobalWriteXLSXData &state;
+	void BeginRow() {
+		if (state.appender) {
+			state.appender->BeginRow();
+		} else {
+			state.fresh_writer->BeginRow();
+		}
+	}
+	void EndRow() {
+		if (state.appender) {
+			state.appender->EndRow();
+		} else {
+			state.fresh_writer->EndRow();
+		}
+	}
+	void WriteEmptyCell() {
+		if (state.appender) {
+			state.appender->WriteEmptyCell();
+		} else {
+			state.fresh_writer->WriteEmptyCell();
+		}
+	}
+	void WriteBooleanCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteBooleanCell(v);
+		} else {
+			state.fresh_writer->WriteBooleanCell(v);
+		}
+	}
+	void WriteDateCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteDateCell(v);
+		} else {
+			state.fresh_writer->WriteDateCell(v);
+		}
+	}
+	void WriteTimeCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteTimeCell(v);
+		} else {
+			state.fresh_writer->WriteTimeCell(v);
+		}
+	}
+	void WriteTimestampCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteTimestampCell(v);
+		} else {
+			state.fresh_writer->WriteTimestampCell(v);
+		}
+	}
+	void WriteTimestampCellNoMilliseconds(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteTimestampCellNoMilliseconds(v);
+		} else {
+			state.fresh_writer->WriteTimestampCellNoMilliseconds(v);
+		}
+	}
+	void WriteNumberCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteNumberCell(v);
+		} else {
+			state.fresh_writer->WriteNumberCell(v);
+		}
+	}
+	void WriteInlineStringCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteInlineStringCell(v);
+		} else {
+			state.fresh_writer->WriteInlineStringCell(v);
+		}
+	}
+};
+} // namespace
+
 static unique_ptr<GlobalFunctionData> InitGlobal(ClientContext &context, FunctionData &bind_data,
                                                  const string &file_path) {
 	auto &data = bind_data.Cast<WriteXLSXData>();
 	auto gstate = make_uniq<GlobalWriteXLSXData>(context, file_path, data);
 
-	auto &writer = gstate->writer;
-
 	// Begin writing the worksheet
-	writer.BeginSheet(data.sheet_name, data.column_names, data.column_types);
+	if (gstate->appender) {
+		gstate->appender->BeginSheet(data.column_names, data.column_types);
+	} else {
+		gstate->fresh_writer->BeginSheet(data.sheet_name, data.column_names, data.column_types);
+	}
 
 	// Write the header
 	if (data.header) {
-		writer.BeginRow();
+		SinkOps ops {*gstate};
+		ops.BeginRow();
 		for (const auto &col_name : data.column_names) {
-			writer.WriteInlineStringCell(string_t(col_name));
+			ops.WriteInlineStringCell(string_t(col_name));
 		}
-		writer.EndRow();
+		ops.EndRow();
 	}
 	return std::move(gstate);
 }
@@ -253,7 +383,7 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
                  LocalFunctionData &lstate, DataChunk &input) {
 	auto &data = bind_data.Cast<WriteXLSXData>();
 	auto &state = gstate.Cast<GlobalWriteXLSXData>();
-	auto &writer = state.writer;
+	SinkOps ops {state};
 
 	const auto row_count = input.size();
 	const auto col_count = input.data.size();
@@ -271,13 +401,13 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 
 	// Now write the rows as xml
 	for (idx_t in_idx = 0; in_idx < row_count; in_idx++) {
-		writer.BeginRow();
+		ops.BeginRow();
 
 		for (idx_t col_idx = 0; col_idx < col_count; col_idx++) {
 			const auto &format = formats[col_idx];
 			const auto row_idx = format.sel->get_index(in_idx);
 			if (!format.validity.RowIsValid(row_idx)) {
-				writer.WriteEmptyCell();
+				ops.WriteEmptyCell();
 				continue;
 			}
 
@@ -286,24 +416,24 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 
 			switch (type.id()) {
 			case LogicalTypeId::BOOLEAN:
-				writer.WriteBooleanCell(val);
+				ops.WriteBooleanCell(val);
 				break;
 			case LogicalTypeId::DATE:
-				writer.WriteDateCell(val);
+				ops.WriteDateCell(val);
 				break;
 			case LogicalTypeId::TIME_TZ:
 			case LogicalTypeId::TIME:
-				writer.WriteTimeCell(val);
+				ops.WriteTimeCell(val);
 				break;
 			case LogicalTypeId::TIMESTAMP_TZ:
 			case LogicalTypeId::TIMESTAMP_MS:
 			case LogicalTypeId::TIMESTAMP_NS:
 			case LogicalTypeId::TIMESTAMP:
-				writer.WriteTimestampCell(val);
+				ops.WriteTimestampCell(val);
 				break;
 			case LogicalTypeId::TIMESTAMP_SEC:
 				// Style this differently (no milliseconds)
-				writer.WriteTimestampCellNoMilliseconds(val);
+				ops.WriteTimestampCellNoMilliseconds(val);
 				break;
 			case LogicalTypeId::TINYINT:
 			case LogicalTypeId::SMALLINT:
@@ -318,14 +448,14 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 			case LogicalTypeId::UINTEGER:
 			case LogicalTypeId::UBIGINT:
 			case LogicalTypeId::UHUGEINT:
-				writer.WriteNumberCell(val);
+				ops.WriteNumberCell(val);
 				break;
 			default:
-				writer.WriteInlineStringCell(val);
+				ops.WriteInlineStringCell(val);
 				break;
 			}
 		}
-		writer.EndRow();
+		ops.EndRow();
 	}
 }
 
@@ -343,8 +473,12 @@ static void Finalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	auto &state = gstate.Cast<GlobalWriteXLSXData>();
 
 	// Finish writing the worksheet
-	state.writer.EndSheet();
-	state.writer.Finish();
+	if (state.appender) {
+		state.appender->Finish();
+	} else {
+		state.fresh_writer->EndSheet();
+		state.fresh_writer->Finish();
+	}
 }
 
 //------------------------------------------------------------------------------

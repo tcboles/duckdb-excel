@@ -1,5 +1,13 @@
 #
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
+# Build the extension binaries and publish them to GitHub Pages so the extension
+# can be installed via:
+#
+#   SET allow_unsigned_extensions=true;
+#   INSTALL excel FROM 'https://<user>.github.io/<repo>';
+#   LOAD excel;
+#
+# Pages deploy runs on push to main and on manual workflow_dispatch. PRs and
+# other branches build but don't deploy.
 #
 name: Main Extension Distribution Pipeline
 on:
@@ -13,22 +21,84 @@ concurrency:
 
 jobs:
   duckdb-stable-build:
-    name: Build extension binaries
+    name: Build extension binaries (DuckDB ${{ matrix.duckdb_version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        duckdb_version: [v1.4.4, v1.5.2]
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: main
+      duckdb_version: ${{ matrix.duckdb_version }}
       ci_tools_version: main
       extension_name: excel
+      # Default 'auto' trims the matrix on non-main branches — we publish from
+      # `xlsx-fast-append` (Pages source), so force the full platform set so
+      # every release lands the same arch coverage as a main-branch build.
+      reduced_ci_mode: 'disabled'
 
-  duckdb-stable-deploy:
-    name: Deploy extension binaries
+  deploy-pages:
+    name: Publish to GitHub Pages
     needs: duckdb-stable-build
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@v1.4.0
-    if: false # TODO: re-enable when switching back to latest stable
-    secrets: inherit
-    with:
-      duckdb_version: v1.4.0
-      ci_tools_version: v1.4.0
-      extension_name: excel
-      deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
-      deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+    # Deploy on every push (any branch) and on manual dispatch. Skip PR builds since
+    # they can't access secrets/permissions and would conflict with the head-branch run.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download all extension artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # Matches every `excel-<duckdb_version>-extension-<arch>` artifact
+          # produced by the build matrix, across all DuckDB versions.
+          pattern: excel-v*-extension-*
+          path: artifacts
+
+      - name: Organize artifacts into DuckDB extension repo layout
+        run: |
+          set -euxo pipefail
+          mkdir -p public
+          for dir in artifacts/excel-v*-extension-*; do
+            base="${dir##*/}"                          # excel-v1.4.3-extension-osx_arm64
+            rest="${base#excel-}"                      # v1.4.3-extension-osx_arm64
+            duckdb_version="${rest%%-extension-*}"     # v1.4.3
+            arch="${rest##*-extension-}"               # osx_arm64
+            ext_file=$(find "$dir" -name 'excel.duckdb_extension' | head -1)
+            if [ -z "$ext_file" ]; then
+              echo "::warning::no excel.duckdb_extension found in $dir"
+              continue
+            fi
+            mkdir -p "public/${duckdb_version}/${arch}"
+            gzip -nc "$ext_file" > "public/${duckdb_version}/${arch}/excel.duckdb_extension.gz"
+            echo "deployed: ${duckdb_version}/${arch}/excel.duckdb_extension.gz"
+          done
+          PAGES_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          {
+            echo '<!doctype html><meta charset="utf-8">'
+            echo '<title>DuckDB Excel extension repository</title>'
+            echo '<h1>DuckDB Excel extension repository</h1>'
+            echo '<p>Install via:</p>'
+            echo '<pre>SET allow_unsigned_extensions=true;'
+            echo "INSTALL excel FROM '${PAGES_URL}';"
+            echo 'LOAD excel;</pre>'
+            echo '<h2>Available binaries</h2><ul>'
+            (cd public && find . -name '*.duckdb_extension.gz' | sort | sed 's|^\./|<li><a href="|; s|$|">|; s|$|</a></li>|')
+            echo '</ul>'
+          } > public/index.html
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
