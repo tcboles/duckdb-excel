@@ -86,6 +86,7 @@ private:
 	};
 
 	static string ReadEntryAsString(ZipFileReader &reader, const string &entry_name);
+	static vector<char> ReadEntryAsBytes(ZipFileReader &reader, const string &entry_name);
 	static idx_t ParseRidNumber(const string &rid);
 	static string ToLowerAscii(const string &input);
 
@@ -125,10 +126,47 @@ private:
 	// Set of source entries that get rewritten and must NOT be copied verbatim.
 	std::unordered_set<string> rewrite_set;
 
+	// Verbatim entries buffered from the source archive. Buffered up-front so we can
+	// close the source file before opening the destination — Windows refuses to rename
+	// over a file that still has any open handle on it (ERROR_SHARING_VIOLATION).
+	struct BufferedEntry {
+		string name;
+		vector<char> bytes;
+	};
+	vector<BufferedEntry> verbatim_entries;
+
 	unique_ptr<XLXSWriter> writer;
 };
 
 //===-- Implementation --------------------------------------------------------------------===//
+
+inline vector<char> XLSXAppender::ReadEntryAsBytes(ZipFileReader &reader, const string &entry_name) {
+	if (!reader.TryOpenEntry(entry_name)) {
+		throw IOException("Required entry '%s' not found in xlsx file", entry_name);
+	}
+	const auto entry_len = reader.GetEntryLen();
+	vector<char> result;
+	result.resize(entry_len);
+	idx_t pos = 0;
+	constexpr idx_t BUFFER_SIZE = 4096;
+	char buffer[BUFFER_SIZE];
+	while (!reader.IsDone()) {
+		const auto read_size = reader.Read(buffer, BUFFER_SIZE);
+		if (read_size == 0) {
+			break;
+		}
+		if (pos + read_size > result.size()) {
+			result.resize(pos + read_size);
+		}
+		std::memcpy(result.data() + pos, buffer, read_size);
+		pos += read_size;
+	}
+	if (pos < result.size()) {
+		result.resize(pos);
+	}
+	reader.CloseEntry();
+	return result;
+}
 
 inline string XLSXAppender::ReadEntryAsString(ZipFileReader &reader, const string &entry_name) {
 	if (!reader.TryOpenEntry(entry_name)) {
@@ -186,7 +224,11 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
     : context(context_p), source_path(source_path_p), dest_path(dest_path_p), sheet_name(sheet_name_p),
       replace(replace_p), sheet_row_limit(sheet_row_limit_p) {
 
-	// 1. Open the source archive
+	// We deliberately scope the source ZipFileReader so its file handle is closed BEFORE the
+	// destination writer is opened. On Windows the COPY framework's final rename fails if any
+	// handle on the user-visible target file is still open (ERROR_SHARING_VIOLATION). All
+	// data we'll need to copy verbatim is buffered into `verbatim_entries` inside this scope.
+	{
 	ZipFileReader source(context, source_path);
 
 	// 2. Read raw bytes of the metadata files we'll rewrite. Every well-formed xlsx must have these.
@@ -329,19 +371,41 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 		rewrite_set.insert("xl/styles.xml");
 	}
 
-	// 6. Open the writer directly on the destination path. The caller (DuckDB COPY framework)
-	// is responsible for atomic-renaming dest_path onto the user-visible target after Finish.
-	writer = make_uniq<XLXSWriter>(context, dest_path, sheet_row_limit);
-	writer->SetStyleIndices(styles.date, styles.ts_no_ms, styles.time_, styles.ts_with_ms, styles.boolean);
-
+	// 6. Buffer every entry that will be copied verbatim. Reading is fast and the data is
+	// small (xlsx files are bounded; the cost is dwarfed by the cell-write loop).
 	const auto entry_names = source.ListEntries();
+	verbatim_entries.reserve(entry_names.size());
 	for (auto &entry : entry_names) {
 		if (rewrite_set.find(entry) != rewrite_set.end()) {
 			continue;
 		}
-		writer->GetStream().CopyEntryFrom(source, entry);
+		// Skip directory entries (filename ends in '/'); the writer never needs them and
+		// they confuse the BeginFile/Write/EndFile API.
+		if (!entry.empty() && entry.back() == '/') {
+			continue;
+		}
+		BufferedEntry buf;
+		buf.name = entry;
+		buf.bytes = ReadEntryAsBytes(source, entry);
+		verbatim_entries.push_back(std::move(buf));
 	}
-	// source falls out of scope — file handle closes
+	} // source destroyed here — file handle on source_path is released
+
+	// 7. Now open the writer on the destination path and emit the buffered entries.
+	// At this point no handle on source_path remains open, so the COPY framework's final
+	// rename of dest_path onto source_path will succeed even on Windows.
+	writer = make_uniq<XLXSWriter>(context, dest_path, sheet_row_limit);
+	writer->SetStyleIndices(styles.date, styles.ts_no_ms, styles.time_, styles.ts_with_ms, styles.boolean);
+
+	for (auto &entry : verbatim_entries) {
+		auto &out = writer->GetStream();
+		out.BeginFile(entry.name);
+		if (!entry.bytes.empty()) {
+			out.Write(entry.bytes.data(), entry.bytes.size());
+		}
+		out.EndFile();
+	}
+	verbatim_entries.clear();  // free memory; we no longer need the buffers
 }
 
 inline void XLSXAppender::BeginSheet(const vector<string> &sql_column_names,
