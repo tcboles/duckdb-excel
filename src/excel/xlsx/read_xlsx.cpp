@@ -434,6 +434,26 @@ void ReadXLSX::ResolveSheet(const unique_ptr<XLSXReadData> &result, ZipFileReade
 }
 
 //-------------------------------------------------------------------
+// FileSystem::GlobFiles signature changed between DuckDB v1.4.x (3-arg with ClientContext)
+// and v1.5.x (2-arg — ClientContext was dropped). DuckDB doesn't expose a preprocessor
+// version macro we can branch on, so use SFINAE: the int/... ranking makes the 2-arg
+// overload preferred when both compile, but only the matching one compiles per version.
+//-------------------------------------------------------------------
+namespace {
+template <typename FS>
+auto CallGlobFiles(FS &fs, const string &path, ClientContext &, int)
+    -> decltype(fs.GlobFiles(path, FileGlobOptions::ALLOW_EMPTY)) {
+	return fs.GlobFiles(path, FileGlobOptions::ALLOW_EMPTY);
+}
+
+template <typename FS>
+auto CallGlobFiles(FS &fs, const string &path, ClientContext &ctx, ...)
+    -> decltype(fs.GlobFiles(path, ctx, FileGlobOptions::ALLOW_EMPTY)) {
+	return fs.GlobFiles(path, ctx, FileGlobOptions::ALLOW_EMPTY);
+}
+} // namespace
+
+//-------------------------------------------------------------------
 // Bind
 //-------------------------------------------------------------------
 static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input,
@@ -444,8 +464,7 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindIn
 
 	// Glob here so that we auto load any required extension filesystems
 	auto &fs = FileSystem::GetFileSystem(context);
-	// v1.5.2 changed GlobFiles to 2-arg (FileGlobInput wraps the options); ClientContext is no longer required.
-	auto files = fs.GlobFiles(file_path, FileGlobOptions::ALLOW_EMPTY);
+	auto files = CallGlobFiles(fs, file_path, context, 0);
 	if (files.empty()) {
 		// Use our own error message to be less confusing
 		throw IOException("Cannot open file \"%s\": No such file or directory", file_path);
