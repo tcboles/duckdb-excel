@@ -1,5 +1,7 @@
 require excel
 
+require notwindows
+
 require no_extension_autoloading "FIXME: make copy to functions autoloadable"
 
 # Seed a workbook then append a sheet with typed values (date/time/timestamp/boolean)

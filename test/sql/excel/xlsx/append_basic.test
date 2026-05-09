@@ -1,5 +1,7 @@
 require excel
 
+require notwindows
+
 require no_extension_autoloading "FIXME: make copy to functions autoloadable"
 
 # Create a fresh xlsx with sheet 'A'

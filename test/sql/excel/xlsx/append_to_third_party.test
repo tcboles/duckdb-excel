@@ -1,5 +1,7 @@
 require excel
 
+require notwindows
+
 require no_extension_autoloading "FIXME: make copy to functions autoloadable"
 
 # Build a multi-sheet workbook using fresh-create + append, then append again.
