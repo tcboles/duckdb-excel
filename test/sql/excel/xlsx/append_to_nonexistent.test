@@ -1,3 +1,6 @@
+# name: test/sql/excel/xlsx/append_to_nonexistent.test
+# group: [xlsx]
+
 require excel
 
 require no_extension_autoloading "FIXME: make copy to functions autoloadable"

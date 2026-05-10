@@ -28,9 +28,7 @@ public:
 	void EndFile();
 	void Finalize();
 
-	// Copy the source reader's CURRENTLY-POSITIONED entry verbatim into this writer.
-	// Uses minizip's raw-copy primitive — no decompression or recompression. Caller must
-	// position the reader (e.g. via GotoFirstEntry / GotoNextEntry) before calling.
+	// Raw-copy the source reader's current entry (no decompress/recompress).
 	void CopyCurrentEntryFrom(ZipFileReader &source);
 
 private:
@@ -60,16 +58,14 @@ public:
 	// Returns if the current entry is done
 	bool IsDone() const;
 
-	// Walk all entries in the archive and return their names. The reader must not have an entry currently open.
+	// Returns the names of all entries in the archive.
 	vector<string> ListEntries();
 
-	// Returns true if the entry exists and is a directory entry (filename ends with '/').
+	// Returns true if `entry_name` exists and is a directory entry.
 	bool EntryIsDirectory(const string &entry_name);
 
-	// Position the cursor for sequential entry walking. Returns false when no more entries
-	// (or on error). After GotoFirstEntry / GotoNextEntry returns true, the reader is positioned
-	// on an entry and CurrentEntryName / CurrentEntryIsDirectory / ZipFileWriter::CopyCurrentEntryFrom
-	// can be used.
+	// Sequential entry-walking primitives. After Goto* returns true the reader is positioned
+	// on an entry; Current* / ZipFileWriter::CopyCurrentEntryFrom are then valid.
 	bool GotoFirstEntry();
 	bool GotoNextEntry();
 	string CurrentEntryName();

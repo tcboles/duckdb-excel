@@ -1,6 +1,10 @@
+# name: test/sql/excel/xlsx/append_styles_preserved.test
+# group: [xlsx]
+
 require excel
 
-require notwindows
+require notwindows  # COPY framework MoveTmpFile races with Defender on consecutive same-path writes
+
 
 require no_extension_autoloading "FIXME: make copy to functions autoloadable"
 

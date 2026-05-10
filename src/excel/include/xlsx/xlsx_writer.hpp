@@ -9,8 +9,8 @@ class XLXSWriter {
 public:
 	void BeginSheet(const string &sheet_name, const vector<string> &sql_column_names,
 	                const vector<LogicalType> &sql_column_types);
-	// Overload used by the appender: explicit sheet filename, skips directory creation
-	// (the appender copies the directory entries verbatim from the source archive).
+	// Overload used by XLSXAppender: explicit sheet filename, skips directory creation
+	// (the appender stream-copies directory entries verbatim from the source archive).
 	void BeginSheet(const string &sheet_name, const string &sheet_filename,
 	                const vector<string> &sql_column_names, const vector<LogicalType> &sql_column_types);
 	void EndSheet();
@@ -32,12 +32,12 @@ public:
 
 	void Finish();
 
-	// Override style indices for date/time/timestamp/boolean cells. Used by the appender after
-	// resolving styles against an existing styles.xml. Defaults match this writer's own styles.xml.
+	// Override style indices for typed cells. Used by XLSXAppender after resolving
+	// styles against an existing styles.xml.
 	void SetStyleIndices(idx_t date, idx_t timestamp_no_ms, idx_t time_, idx_t timestamp_with_ms, idx_t boolean);
 
-	// Direct access to the underlying zip stream. Used by the appender to copy source entries
-	// verbatim and to write its own modified metadata files.
+	// Direct access to the underlying stream so XLSXAppender can stream-copy entries
+	// and emit its own metadata files.
 	ZipFileWriter &GetStream() {
 		return stream;
 	}
@@ -68,8 +68,7 @@ private:
 	ZipFileWriter stream;
 	idx_t sheet_row_limit = XLSX_MAX_CELL_ROWS;
 
-	// Style indices for typed cells. Defaults match this writer's own styles.xml; the appender
-	// overrides them after resolving styles against an existing styles.xml.
+	// Style indices for typed cells. Defaults match this writer's own styles.xml.
 	idx_t style_idx_date = 1;
 	idx_t style_idx_ts_no_ms = 2;
 	idx_t style_idx_time = 3;
@@ -90,6 +89,18 @@ private:
 
 static constexpr auto ENCODING_FRAGMENT = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 )";
+
+inline void XLXSWriter::BeginSheet(const string &sheet_name, const vector<string> &sql_column_names,
+                                   const vector<LogicalType> &sql_column_types) {
+
+	if (written_sheets.empty()) {
+		// We need to create the directory for sheets
+		stream.AddDirectory("xl/");
+		stream.AddDirectory("xl/worksheets/");
+	}
+	BeginSheet(sheet_name, "sheet" + std::to_string(written_sheets.size() + 1) + ".xml", sql_column_names,
+	           sql_column_types);
+}
 
 inline void XLXSWriter::BeginSheet(const string &sheet_name, const string &sheet_filename,
                                    const vector<string> &sql_column_names,
@@ -145,17 +156,6 @@ inline void XLXSWriter::BeginSheet(const string &sheet_name, const string &sheet
 	stream.BeginFile("xl/worksheets/" + active_sheet.sheet_file);
 	stream.Write(ENCODING_FRAGMENT);
 	stream.Write(WORKSHEET_XML_START);
-}
-
-inline void XLXSWriter::BeginSheet(const string &sheet_name, const vector<string> &sql_column_names,
-                                   const vector<LogicalType> &sql_column_types) {
-	if (written_sheets.empty()) {
-		// We need to create the directory for sheets
-		stream.AddDirectory("xl/");
-		stream.AddDirectory("xl/worksheets/");
-	}
-	const auto sheet_filename = "sheet" + std::to_string(written_sheets.size() + 1) + ".xml";
-	BeginSheet(sheet_name, sheet_filename, sql_column_names, sql_column_types);
 }
 
 inline void XLXSWriter::SetStyleIndices(idx_t date, idx_t timestamp_no_ms, idx_t time_, idx_t timestamp_with_ms,

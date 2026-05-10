@@ -1,4 +1,6 @@
 #include "duckdb/common/exception/conversion_exception.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -9,9 +11,30 @@
 #include "xlsx/xlsx_appender.hpp"
 #include "xlsx/xlsx_writer.hpp"
 
-#include "duckdb/common/file_system.hpp"
-
 namespace duckdb {
+
+// Forward declaration. Defined in DuckDB v1.5+ (`duckdb/function/scalar_function.hpp`).
+// In v1.4.x this remains an incomplete type, which is fine — the SFINAE adapter below
+// only references it when the v1.5+ BoundFunctionExpression constructor is selected.
+class BoundScalarFunction;
+
+namespace {
+// BoundFunctionExpression's constructor changed between v1.4.x and v1.5+:
+//   v1.4: BoundFunctionExpression(LogicalType, ScalarFunction, vector, FunctionData)
+//   v1.5: BoundFunctionExpression(BoundScalarFunction, vector, FunctionData)
+// SFINAE-dispatch picks whichever exists.
+template <typename SF>
+auto MakeBoundFunctionExpr(LogicalType, SF sfunc, vector<unique_ptr<Expression>> args, int)
+    -> decltype(make_uniq<BoundFunctionExpression>(BoundScalarFunction(std::declval<SF>()), std::move(args), nullptr)) {
+	return make_uniq<BoundFunctionExpression>(BoundScalarFunction(std::move(sfunc)), std::move(args), nullptr);
+}
+template <typename SF>
+auto MakeBoundFunctionExpr(LogicalType return_type, SF sfunc, vector<unique_ptr<Expression>> args, ...)
+    -> decltype(make_uniq<BoundFunctionExpression>(std::declval<LogicalType>(), std::declval<SF>(), std::move(args),
+                                                   nullptr)) {
+	return make_uniq<BoundFunctionExpression>(return_type, std::move(sfunc), std::move(args), nullptr);
+}
+} // namespace
 
 //------------------------------------------------------------------------------
 // Conversion Expressions
@@ -56,7 +79,7 @@ static unique_ptr<Expression> TimestampConversionExpr(unique_ptr<Expression> ref
 
 	ScalarFunction sfunc("timestamp_to_excel_number", {LogicalType::TIMESTAMP}, LogicalType::DOUBLE,
 	                     TimestampToExcelNumberFunction);
-	auto func = make_uniq<BoundFunctionExpression>(LogicalType::DOUBLE, sfunc, std::move(children), nullptr);
+	auto func = MakeBoundFunctionExpr(LogicalType::DOUBLE, sfunc, std::move(children), 0);
 	return std::move(func);
 }
 
@@ -65,7 +88,7 @@ static unique_ptr<Expression> TimeConversionExpr(unique_ptr<Expression> ref) {
 	children.push_back(std::move(ref));
 
 	ScalarFunction sfunc("time_to_excel_number", {LogicalType::TIME}, LogicalType::DOUBLE, TimeToExcelNumberFunction);
-	auto func = make_uniq<BoundFunctionExpression>(LogicalType::DOUBLE, sfunc, std::move(children), nullptr);
+	auto func = MakeBoundFunctionExpr(LogicalType::DOUBLE, sfunc, std::move(children), 0);
 	return std::move(func);
 }
 
@@ -74,7 +97,7 @@ static unique_ptr<Expression> DateConversionExpr(unique_ptr<Expression> ref) {
 	children.push_back(std::move(ref));
 
 	ScalarFunction sfunc("date_to_excel_number", {LogicalType::DATE}, LogicalType::DOUBLE, DateToExcelNumberFunction);
-	auto func = make_uniq<BoundFunctionExpression>(LogicalType::DOUBLE, sfunc, std::move(children), nullptr);
+	auto func = MakeBoundFunctionExpr(LogicalType::DOUBLE, sfunc, std::move(children), 0);
 	return std::move(func);
 }
 
@@ -92,7 +115,6 @@ struct WriteXLSXData final : TableFunctionData {
 	bool append = false;
 	bool replace = false;
 };
-
 
 static void ParseCopyToOptions(const unique_ptr<WriteXLSXData> &data,
                                const case_insensitive_map_t<vector<Value>> &options) {
@@ -154,25 +176,20 @@ static void ParseCopyToOptions(const unique_ptr<WriteXLSXData> &data,
 	// MODE option: 'create' (default), 'append', or 'replace'
 	const auto mode_opt = options.find("mode");
 	if (mode_opt != options.end()) {
-		if (mode_opt->second.size() != 1) {
-			throw BinderException("MODE option must be a single string value ('create', 'append', or 'replace')");
+		if (mode_opt->second.size() != 1 || mode_opt->second.back().IsNull() ||
+		    mode_opt->second.back().type() != LogicalType::VARCHAR) {
+			throw BinderException("MODE option must be a string ('create', 'append', or 'replace')");
 		}
-		const auto &mode_val = mode_opt->second.back();
-		if (mode_val.IsNull() || mode_val.type() != LogicalType::VARCHAR) {
-			throw BinderException("MODE option must be a single string value ('create', 'append', or 'replace')");
-		}
-		const auto mode_str = StringUtil::Lower(StringValue::Get(mode_val));
+		const auto mode_str = StringUtil::Lower(StringValue::Get(mode_opt->second.back()));
 		if (mode_str == "create") {
 			data->append = false;
 			data->replace = false;
 		} else if (mode_str == "append") {
 			data->append = true;
-			data->replace = false;
 		} else if (mode_str == "replace") {
-			data->append = false;
 			data->replace = true;
 		} else {
-			throw BinderException("Invalid MODE '%s' — expected 'create', 'append', or 'replace'", mode_str);
+			throw BinderException("Invalid MODE '%s' (expected 'create', 'append', or 'replace')", mode_str);
 		}
 	}
 }
@@ -196,22 +213,19 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, CopyFunctionBindInp
 //------------------------------------------------------------------------------
 struct GlobalWriteXLSXData final : public GlobalFunctionData {
 
-	// Exactly one of these is set after construction.
+	// Exactly one of these is set per COPY: fresh_writer for MODE 'create' or no MODE,
+	// appender for MODE 'append' / 'replace' against an existing file.
 	unique_ptr<XLXSWriter> fresh_writer;
 	unique_ptr<XLSXAppender> appender;
-
 	DataChunk cast_chunk;
 	ExpressionExecutor executor;
 	vector<unique_ptr<Expression>> conversion_expressions;
 
-	GlobalWriteXLSXData(ClientContext &context, const string &file_path, const WriteXLSXData &data)
-	    : executor(context) {
+	GlobalWriteXLSXData(ClientContext &context, const string &file_path, const WriteXLSXData &data) : executor(context) {
 
-		// DuckDB's COPY framework hands us a temp file path (`file_path`) that it will atomically
-		// rename onto the user's target (`data.file_path`) after Finalize. The user-visible path
-		// may contain `~` etc, so expand it before checking existence; the framework already
-		// expands the temp path it hands us.
 		auto &fs = FileSystem::GetFileSystem(context);
+		// data.file_path is the user-typed path (may contain `~`); the framework hands us
+		// `file_path` as the temp it'll rename. Expand the user-typed path before checking.
 		const auto target_path = fs.ExpandPath(data.file_path);
 		const bool target_exists = fs.FileExists(target_path);
 		const bool use_appender = (data.append || data.replace) && target_exists;
@@ -266,9 +280,10 @@ struct GlobalWriteXLSXData final : public GlobalFunctionData {
 	}
 };
 
-// Tiny dispatch helpers so Sink can stay readable without an interface.
+// Tiny dispatcher: GlobalWriteXLSXData holds either a fresh XLXSWriter or an XLSXAppender.
+// Sink/InitGlobal/Finalize forward through this so the hot loop doesn't repeat branches.
 namespace {
-struct SinkOps {
+struct WriteDispatch {
 	GlobalWriteXLSXData &state;
 	void BeginRow() {
 		if (state.appender) {
@@ -357,12 +372,12 @@ static unique_ptr<GlobalFunctionData> InitGlobal(ClientContext &context, Functio
 
 	// Write the header
 	if (data.header) {
-		SinkOps ops {*gstate};
-		ops.BeginRow();
+		WriteDispatch sink {*gstate};
+		sink.BeginRow();
 		for (const auto &col_name : data.column_names) {
-			ops.WriteInlineStringCell(string_t(col_name));
+			sink.WriteInlineStringCell(string_t(col_name));
 		}
-		ops.EndRow();
+		sink.EndRow();
 	}
 	return std::move(gstate);
 }
@@ -383,7 +398,7 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
                  LocalFunctionData &lstate, DataChunk &input) {
 	auto &data = bind_data.Cast<WriteXLSXData>();
 	auto &state = gstate.Cast<GlobalWriteXLSXData>();
-	SinkOps ops {state};
+	WriteDispatch writer {state};
 
 	const auto row_count = input.size();
 	const auto col_count = input.data.size();
@@ -401,13 +416,13 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 
 	// Now write the rows as xml
 	for (idx_t in_idx = 0; in_idx < row_count; in_idx++) {
-		ops.BeginRow();
+		writer.BeginRow();
 
 		for (idx_t col_idx = 0; col_idx < col_count; col_idx++) {
 			const auto &format = formats[col_idx];
 			const auto row_idx = format.sel->get_index(in_idx);
 			if (!format.validity.RowIsValid(row_idx)) {
-				ops.WriteEmptyCell();
+				writer.WriteEmptyCell();
 				continue;
 			}
 
@@ -416,24 +431,24 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 
 			switch (type.id()) {
 			case LogicalTypeId::BOOLEAN:
-				ops.WriteBooleanCell(val);
+				writer.WriteBooleanCell(val);
 				break;
 			case LogicalTypeId::DATE:
-				ops.WriteDateCell(val);
+				writer.WriteDateCell(val);
 				break;
 			case LogicalTypeId::TIME_TZ:
 			case LogicalTypeId::TIME:
-				ops.WriteTimeCell(val);
+				writer.WriteTimeCell(val);
 				break;
 			case LogicalTypeId::TIMESTAMP_TZ:
 			case LogicalTypeId::TIMESTAMP_MS:
 			case LogicalTypeId::TIMESTAMP_NS:
 			case LogicalTypeId::TIMESTAMP:
-				ops.WriteTimestampCell(val);
+				writer.WriteTimestampCell(val);
 				break;
 			case LogicalTypeId::TIMESTAMP_SEC:
 				// Style this differently (no milliseconds)
-				ops.WriteTimestampCellNoMilliseconds(val);
+				writer.WriteTimestampCellNoMilliseconds(val);
 				break;
 			case LogicalTypeId::TINYINT:
 			case LogicalTypeId::SMALLINT:
@@ -448,14 +463,14 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 			case LogicalTypeId::UINTEGER:
 			case LogicalTypeId::UBIGINT:
 			case LogicalTypeId::UHUGEINT:
-				ops.WriteNumberCell(val);
+				writer.WriteNumberCell(val);
 				break;
 			default:
-				ops.WriteInlineStringCell(val);
+				writer.WriteInlineStringCell(val);
 				break;
 			}
 		}
-		ops.EndRow();
+		writer.EndRow();
 	}
 }
 
@@ -472,7 +487,6 @@ static void Combine(ExecutionContext &context, FunctionData &bind_data, GlobalFu
 static void Finalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
 	auto &state = gstate.Cast<GlobalWriteXLSXData>();
 
-	// Finish writing the worksheet
 	if (state.appender) {
 		state.appender->Finish();
 	} else {

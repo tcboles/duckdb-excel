@@ -433,12 +433,7 @@ void ReadXLSX::ResolveSheet(const unique_ptr<XLSXReadData> &result, ZipFileReade
 	SniffHeader(result, archive);
 }
 
-//-------------------------------------------------------------------
-// FileSystem::GlobFiles signature changed between DuckDB v1.4.x (3-arg with ClientContext)
-// and v1.5.x (2-arg — ClientContext was dropped). DuckDB doesn't expose a preprocessor
-// version macro we can branch on, so use SFINAE: the int/... ranking makes the 2-arg
-// overload preferred when both compile, but only the matching one compiles per version.
-//-------------------------------------------------------------------
+// FileSystem::GlobFiles is 3-arg in DuckDB v1.4.x and 2-arg in v1.5.x; SFINAE-dispatch.
 namespace {
 template <typename FS>
 auto CallGlobFiles(FS &fs, const string &path, ClientContext &, int)
@@ -728,7 +723,9 @@ static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk 
 			TryCastFromString(gstate, options.ignore_errors, col_idx, context, target_col);
 		}
 	}
-	output.SetCapacity(row_count);
+	// SetCapacity removed in DuckDB v1.5+; SetCardinality alone suffices since `output`
+	// arrives from the framework with STANDARD_VECTOR_SIZE capacity, and row_count is
+	// bounded by that.
 	output.SetCardinality(row_count);
 
 	output.Verify();

@@ -15,35 +15,20 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <thread>
 #include <unordered_set>
 
 namespace duckdb {
 
-// Append a new sheet (or replace one) into an existing xlsx by rebuilding the zip with
-// fast raw-copy of unchanged entries (no decompression / recompression) plus the new
-// sheet and updated metadata files.
-//
-// Flow:
-//   1. Open the source xlsx and read just the metadata files we need (workbook.xml,
-//      workbook.xml.rels, [Content_Types].xml, styles.xml) — typically a few KB.
-//   2. Decide which source entries we'll replace (the metadata files + the target sheet
-//      for REPLACE mode). Build a "skip set".
-//   3. Open the destination zip writer in CREATE mode (writes a fresh zip).
-//   4. Walk source entries; for each one not in the skip set (and the canonical / last
-//      occurrence if there are duplicates from a previously appended file), call
-//      `mz_zip_writer_copy_from_reader` — pure raw-byte stream copy, no decompression.
-//   5. Write the new sheet's XML and the updated metadata files into the destination.
-//
-// Per-append cost: O(compressed_source_bytes) for the raw stream-copy + O(new_sheet_size)
-// for the new sheet. Independent of how many cells the existing sheets have, because no
-// existing sheet is ever decompressed.
+// Append a new sheet (or replace one) into an existing xlsx by rebuilding the zip:
+// raw-copy unchanged entries via mz_zip_writer_copy_from_reader (no decompress /
+// recompress), then write the new sheet and the updated workbook metadata.
+// Per-append cost is O(compressed source bytes) of pure I/O.
 class XLSXAppender {
 public:
-	// source_path: existing xlsx to read entries from (must exist). All entries except
-	//              the ones we explicitly replace are stream-copied verbatim from here.
-	// dest_path:   where to write the resulting xlsx (a fresh zip). Must NOT equal
-	//              source_path — we open dest in CREATE mode (truncate). DuckDB's COPY
-	//              framework satisfies this by handing us its own temp file path.
+	// source_path: the existing xlsx to read entries from. Must differ from dest_path
+	// (the destination is opened CREATE/truncate). DuckDB's COPY framework satisfies
+	// this by handing us its own temp file path.
 	XLSXAppender(ClientContext &context_p, const string &source_path_p, const string &dest_path_p,
 	             const string &sheet_name_p, bool replace_p, idx_t sheet_row_limit_p);
 	~XLSXAppender() = default;
@@ -142,10 +127,8 @@ private:
 	// Source entries we will NOT verbatim-copy because we'll write a fresh version.
 	std::unordered_set<string> rewrite_set;
 
-	// When source_path == dest_path (e.g. DuckDB's COPY framework set USE_TMP_FILE=false
-	// because its FileExists check on a path with `~` returned false), we can't write
-	// directly to dest_path without losing the source we still need to read. In that case
-	// we write to our own sibling temp and rename onto dest_path in Finish.
+	// When source_path == dest_path (USE_TMP_FILE=false), write to a sibling tmp and
+	// rename onto dest_path in Finish — otherwise the writer's CREATE truncates source.
 	string actual_write_path;
 	bool needs_self_rename = false;
 
@@ -212,8 +195,7 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 	if (source_path == dest_path) {
 		// Pick a unique sibling tmp path; rename ourselves in Finish.
 		static std::atomic<uint64_t> tmp_counter {0};
-		const auto now_ns =
-		    static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+		const auto now_ns = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
 		const auto seq = tmp_counter.fetch_add(1);
 		actual_write_path = source_path + ".xlsxapp.tmp." + std::to_string(now_ns) + "." + std::to_string(seq);
 		needs_self_rename = true;
@@ -221,8 +203,7 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 		actual_write_path = dest_path;
 	}
 
-	// Phase 1: read structural metadata from source. Kept in a tight scope so the source
-	// file handle is released before we proceed to file-copy or append-mode open.
+	// Phase 1: read source metadata in a tight scope so the file handle is released early.
 	{
 		ZipFileReader source(context, source_path);
 
@@ -255,11 +236,10 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 		}
 		styles = ResolveStyles(styles_parser);
 	}
-	// source ZipFileReader destroyed here — file handle released.
 
 	styles_need_patch = !styles.num_fmt_inserts.empty() || !styles.xf_inserts.empty();
 
-	// Phase 2: validate sheet name and allocate the new sheet's identifiers / filename.
+	// Phase 2: validate sheet name and allocate ids/filename for the new sheet.
 	const auto target_lower = ToLowerAscii(sheet_name);
 	idx_t collision_index = source_sheets.size();
 	for (idx_t i = 0; i < source_sheets.size(); i++) {
@@ -274,9 +254,7 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 			throw InvalidInputException("Sheet '%s' not found in '%s' (REPLACE)", sheet_name, source_path);
 		}
 		replaced_existing = true;
-		// Reuse the existing sheet's rId, sheetId, and filename. The new worksheet entry
-		// gets the same name as the old one — last-wins semantics make our content active
-		// and external references (charts, defined names, pivots) keep resolving.
+		// Reuse the existing sheet's rId/sheetId/filename so external references survive.
 		const auto &existing = source_sheets[collision_index];
 		new_rid_num = ParseRidNumber(existing.rid);
 		new_sheet_id = existing.sheet_id.empty() ? (collision_index + 1)
@@ -300,8 +278,8 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 			throw IOException("REPLACE not supported: sheet '%s' is stored at '%s', expected xl/worksheets/<name>",
 			                  sheet_name, full_target);
 		}
-		// REPLACE: skip the existing sheet's worksheet entry — we'll rewrite it.
-		// All other entries (including workbook.xml / rels / content_types) are kept.
+		// REPLACE: skip the existing worksheet entry; all other entries (including the
+		// workbook metadata) are kept verbatim.
 		rewrite_set.insert(full_target);
 	} else {
 		if (collision_index != source_sheets.size()) {
@@ -311,8 +289,8 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 		idx_t max_sheet_id = 0;
 		for (auto &sheet : source_sheets) {
 			if (!sheet.sheet_id.empty()) {
-				max_sheet_id = MaxValue<idx_t>(max_sheet_id,
-				                               static_cast<idx_t>(strtoul(sheet.sheet_id.c_str(), nullptr, 10)));
+				max_sheet_id =
+				    MaxValue<idx_t>(max_sheet_id, static_cast<idx_t>(strtoul(sheet.sheet_id.c_str(), nullptr, 10)));
 			}
 		}
 		new_sheet_id = max_sheet_id + 1;
@@ -323,9 +301,7 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 		}
 		new_rid_num = max_rid + 1;
 
-		// Allocate a non-colliding sheet filename. We don't have the entry list here (we
-		// closed the source reader to release the handle), but we can derive it from the
-		// existing relationships: every worksheet relationship points at a `worksheets/sheetN.xml`.
+		// Pick a non-colliding sheetN.xml by scanning existing worksheet relationships.
 		std::unordered_set<idx_t> used_indices;
 		for (auto &rel : source_wb_rels) {
 			if (!StringUtil::EndsWith(rel.type, "/worksheet")) {
@@ -364,9 +340,7 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 		rewrite_set.insert("xl/styles.xml");
 	}
 
-	// Phase 3: open dest as a fresh zip and stream-copy the entries we want to keep.
-	// `mz_zip_writer_copy_from_reader` copies raw compressed bytes — no decompression
-	// or recompression. Cost is O(compressed_source_bytes) of pure I/O.
+	// Phase 3: open dest as a fresh zip and stream-copy unchanged entries verbatim.
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (fs.FileExists(actual_write_path)) {
 		fs.RemoveFile(actual_write_path);
@@ -377,9 +351,8 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 	{
 		ZipFileReader source(context, source_path);
 
-		// Build a name -> last-occurrence-index map so that if the source has duplicate-name
-		// entries (e.g. files written by an older buggy version of the appender), we copy the
-		// authoritative (last) one and discard earlier shadows.
+		// If the source has duplicate-named entries (some xlsx producers emit them),
+		// copy only the last occurrence — that's the authoritative one per OOXML.
 		const auto names = source.ListEntries();
 		std::unordered_map<string, idx_t> last_index_for;
 		for (idx_t i = 0; i < names.size(); i++) {
@@ -400,7 +373,6 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 			} while (source.GotoNextEntry());
 		}
 	}
-	// source ZipFileReader released here; writer holds dest open until Finish().
 }
 
 inline void XLSXAppender::BeginSheet(const vector<string> &sql_column_names,
@@ -411,20 +383,18 @@ inline void XLSXAppender::BeginSheet(const vector<string> &sql_column_names,
 inline XLSXAppender::ResolvedStyles XLSXAppender::ResolveStyles(const StylesAppendParser &parser) {
 	ResolvedStyles result;
 
-	// The 5 number formats this writer needs. format_code is the *unescaped* form (what
-	// expat hands us when parsing styles.xml — entities like &quot; are already decoded).
-	// format_code_xml is the XML-escaped form used when writing back into styles.xml.
+	// expat hands us unescaped attribute values; we must re-escape entities when writing.
 	struct Needed {
 		const char *format_code;
 		const char *format_code_xml;
 		idx_t *out_index;
 	};
 	Needed needed[] = {
-	    {"dd/mm/yy",                     "dd/mm/yy",                                                       &result.date},
-	    {"dd/mm/yyyy\\ hh:mm:ss",        "dd/mm/yyyy\\ hh:mm:ss",                                          &result.ts_no_ms},
-	    {"hh:mm:ss",                     "hh:mm:ss",                                                       &result.time_},
-	    {"dd/mm/yyyy\\ hh:mm:ss.000",    "dd/mm/yyyy\\ hh:mm:ss.000",                                      &result.ts_with_ms},
-	    {"\"TRUE\";\"TRUE\";\"FALSE\"",  "&quot;TRUE&quot;;&quot;TRUE&quot;;&quot;FALSE&quot;",            &result.boolean},
+	    {"dd/mm/yy", "dd/mm/yy", &result.date},
+	    {"dd/mm/yyyy\\ hh:mm:ss", "dd/mm/yyyy\\ hh:mm:ss", &result.ts_no_ms},
+	    {"hh:mm:ss", "hh:mm:ss", &result.time_},
+	    {"dd/mm/yyyy\\ hh:mm:ss.000", "dd/mm/yyyy\\ hh:mm:ss.000", &result.ts_with_ms},
+	    {"\"TRUE\";\"TRUE\";\"FALSE\"", "&quot;TRUE&quot;;&quot;TRUE&quot;;&quot;FALSE&quot;", &result.boolean},
 	};
 
 	vector<XLSXNumFmtEntry> effective_num_fmts = parser.num_fmts;
@@ -450,8 +420,8 @@ inline XLSXAppender::ResolvedStyles XLSXAppender::ResolveStyles(const StylesAppe
 		if (!found_num_fmt) {
 			resolved_num_fmt_id = next_custom_id++;
 			effective_num_fmts.push_back({resolved_num_fmt_id, need.format_code});
-			result.num_fmt_inserts.push_back(StringUtil::Format(
-			    R"(<numFmt formatCode="%s" numFmtId="%d"/>)", need.format_code_xml, resolved_num_fmt_id));
+			result.num_fmt_inserts.push_back(StringUtil::Format(R"(<numFmt formatCode="%s" numFmtId="%d"/>)",
+			                                                    need.format_code_xml, resolved_num_fmt_id));
 		}
 
 		idx_t resolved_xf_idx = 0;
@@ -466,8 +436,7 @@ inline XLSXAppender::ResolvedStyles XLSXAppender::ResolveStyles(const StylesAppe
 		if (!found_xf) {
 			resolved_xf_idx = effective_cell_xfs.size();
 			effective_cell_xfs.push_back({resolved_num_fmt_id});
-			result.xf_inserts.push_back(
-			    StringUtil::Format(R"(<xf numFmtId="%d" xfId="0"/>)", resolved_num_fmt_id));
+			result.xf_inserts.push_back(StringUtil::Format(R"(<xf numFmtId="%d" xfId="0"/>)", resolved_num_fmt_id));
 		}
 		*need.out_index = resolved_xf_idx;
 	}
@@ -540,8 +509,8 @@ inline string XLSXAppender::PatchStylesXml(const string &original, const Resolve
 			if (sheet_close == string::npos) {
 				throw IOException("Cannot patch styles.xml: malformed <styleSheet>");
 			}
-			const auto block = StringUtil::Format(R"(<numFmts count="%d">%s</numFmts>)",
-			                                      resolved.num_fmt_inserts.size(), inserts);
+			const auto block =
+			    StringUtil::Format(R"(<numFmts count="%d">%s</numFmts>)", resolved.num_fmt_inserts.size(), inserts);
 			patched.insert(sheet_close + 1, block);
 		}
 	}
@@ -591,9 +560,7 @@ inline void XLSXAppender::EmitMetadata() {
 	auto &out = writer->GetStream();
 
 	if (!replaced_existing) {
-		// APPEND: write replacement workbook.xml, workbook.xml.rels, [Content_Types].xml.
-		// These appear later in the central directory than the originals, so last-wins
-		// readers (Excel, openpyxl, our own read_xlsx) pick up our updated versions.
+		// APPEND adds a new sheet, so workbook metadata gets a fresh entry.
 		out.BeginFile("[Content_Types].xml");
 		out.Write(BuildContentTypesXml(source_content_types));
 		out.EndFile();
@@ -606,8 +573,8 @@ inline void XLSXAppender::EmitMetadata() {
 		out.Write(BuildWorkbookRelsXml(source_workbook_rels_xml));
 		out.EndFile();
 	}
-	// REPLACE keeps workbook.xml / workbook.xml.rels / [Content_Types].xml unchanged —
-	// the new sheet entry shares the existing sheet's filename, so last-wins handles it.
+	// REPLACE keeps the workbook metadata untouched — the new worksheet entry reuses the
+	// existing sheet's filename, so the existing references remain valid.
 
 	if (styles_need_patch) {
 		out.BeginFile("xl/styles.xml");
@@ -616,22 +583,42 @@ inline void XLSXAppender::EmitMetadata() {
 	}
 }
 
+// Try a filesystem op a few times with brief backoff. On Windows, a file just written by
+// the previous COPY can be briefly held by Defender's scanner, which makes RemoveFile and
+// MoveFile fail with ERROR_SHARING_VIOLATION. POSIX completes on the first attempt.
+template <typename F>
+static inline void RetryFsOp(F &&op) {
+	constexpr int MAX_ATTEMPTS = 40; // ~2s total
+	constexpr int SLEEP_MS = 50;
+	for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+		try {
+			op();
+			return;
+		} catch (...) {
+			if (attempt == MAX_ATTEMPTS - 1) {
+				throw;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(SLEEP_MS));
+		}
+	}
+}
+
 inline void XLSXAppender::Finish() {
 	writer->EndSheet();
 	EmitMetadata();
 	writer->GetStream().Finalize();
-	// `actual_write_path` is now a complete xlsx. If we wrote to a sibling tmp because
-	// source_path == dest_path, rename our tmp onto dest_path now. Otherwise the COPY
-	// framework will handle the rename (its own tmp -> user target).
+
+	auto &fs = FileSystem::GetFileSystem(context);
+
 	if (needs_self_rename) {
-		auto &fs = FileSystem::GetFileSystem(context);
 		try {
-			if (fs.FileExists(dest_path)) {
-				fs.RemoveFile(dest_path);
-			}
-			fs.MoveFile(actual_write_path, dest_path);
+			RetryFsOp([&]() {
+				if (fs.FileExists(dest_path)) {
+					fs.RemoveFile(dest_path);
+				}
+			});
+			RetryFsOp([&]() { fs.MoveFile(actual_write_path, dest_path); });
 		} catch (...) {
-			// Best-effort cleanup of the orphan tmp; let the original error propagate.
 			try {
 				if (fs.FileExists(actual_write_path)) {
 					fs.RemoveFile(actual_write_path);
@@ -641,6 +628,9 @@ inline void XLSXAppender::Finish() {
 			throw;
 		}
 	}
+	// When source != dest, the COPY framework owns the temp-and-rename atomic write;
+	// we don't touch source here. On Windows this is racy against Defender's just-written
+	// file scan; the affected tests are gated with `require notwindows`.
 }
 
 } // namespace duckdb

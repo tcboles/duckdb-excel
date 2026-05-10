@@ -116,21 +116,16 @@ int32_t mz_stream_duckdb_seek(void *stream, int64_t offset, int32_t origin) {
 	auto &self = *reinterpret_cast<mz_stream_duckdb *>(stream);
 	switch (origin) {
 	case MZ_SEEK_SET:
-		self.handle->Seek(static_cast<idx_t>(offset));
+		self.handle->Seek(offset);
 		break;
-	case MZ_SEEK_CUR: {
-		const auto pos = static_cast<int64_t>(self.handle->SeekPosition()) + offset;
-		self.handle->Seek(static_cast<idx_t>(pos < 0 ? 0 : pos));
+	case MZ_SEEK_CUR:
+		self.handle->Seek(self.handle->SeekPosition() + offset);
 		break;
-	}
-	case MZ_SEEK_END: {
-		// minizip uses end-relative seeks (typically negative offset) to find the central
-		// directory in an existing zip; required for append mode.
-		const auto file_size = static_cast<int64_t>(self.handle->GetFileSize());
-		const auto pos = file_size + offset;
-		self.handle->Seek(static_cast<idx_t>(pos < 0 ? 0 : pos));
+	case MZ_SEEK_END:
+		// Seek relative to file end. Required for minizip to locate the central directory
+		// (e.g. when iterating entries via mz_zip_reader_goto_first_entry).
+		self.handle->Seek(self.handle->GetFileSize() + offset);
 		break;
-	}
 	default:
 		return MZ_SEEK_ERROR;
 	}
@@ -329,11 +324,8 @@ ZipFileReader::ZipFileReader(ClientContext &context, const string &file_name) {
 }
 
 bool ZipFileReader::TryOpenEntry(const string &file_name) {
-	// An xlsx that's been appended to with our writer can contain multiple entries with the
-	// same name in the central directory (e.g. the original xl/workbook.xml plus a replacement
-	// emitted by the appender). The OOXML/ZIP convention is last-wins — the entry that appears
-	// LATER in the central directory is the authoritative one. Walk all entries and select the
-	// last one whose filename matches.
+	// Some xlsx producers emit duplicate entry names; per OOXML the last occurrence wins.
+	// Walk all entries and select the last one whose filename matches.
 	int32_t target_index = -1;
 	int32_t current = 0;
 	auto status = mz_zip_reader_goto_first_entry(handle);
@@ -351,7 +343,6 @@ bool ZipFileReader::TryOpenEntry(const string &file_name) {
 		return false;
 	}
 
-	// Re-walk to position at the chosen index. Bounded by entry count (small for xlsx).
 	if (mz_zip_reader_goto_first_entry(handle) != MZ_OK) {
 		return false;
 	}
