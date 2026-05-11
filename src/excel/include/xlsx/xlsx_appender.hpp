@@ -20,15 +20,10 @@
 
 namespace duckdb {
 
-// Append a new sheet (or replace one) into an existing xlsx by rebuilding the zip:
-// raw-copy unchanged entries via mz_zip_writer_copy_from_reader (no decompress /
-// recompress), then write the new sheet and the updated workbook metadata.
-// Per-append cost is O(compressed source bytes) of pure I/O.
+// Append (or replace) a sheet in an existing xlsx by rebuilding the zip via raw entry
+// stream-copy. Per-append cost is O(compressed source bytes), no decompress/recompress.
 class XLSXAppender {
 public:
-	// source_path: the existing xlsx to read entries from. Must differ from dest_path
-	// (the destination is opened CREATE/truncate). DuckDB's COPY framework satisfies
-	// this by handing us its own temp file path.
 	XLSXAppender(ClientContext &context_p, const string &source_path_p, const string &dest_path_p,
 	             const string &sheet_name_p, bool replace_p, idx_t sheet_row_limit_p);
 	~XLSXAppender() = default;
@@ -38,7 +33,6 @@ public:
 
 	void BeginSheet(const vector<string> &sql_column_names, const vector<LogicalType> &sql_column_types);
 
-	// Forwarded to the inner XLXSWriter
 	void BeginRow() {
 		writer->BeginRow();
 	}
@@ -70,7 +64,6 @@ public:
 		writer->WriteEmptyCell();
 	}
 
-	// Close the new sheet, append updated metadata, finalize the zip.
 	void Finish();
 
 private:
@@ -194,9 +187,9 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 
 	if (source_path == dest_path) {
 		// Pick a unique sibling tmp path; rename ourselves in Finish.
-		static std::atomic<uint64_t> tmp_counter {0};
+		static std::atomic<uint64_t> TMP_COUNTER {0};
 		const auto now_ns = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-		const auto seq = tmp_counter.fetch_add(1);
+		const auto seq = TMP_COUNTER.fetch_add(1);
 		actual_write_path = source_path + ".xlsxapp.tmp." + std::to_string(now_ns) + "." + std::to_string(seq);
 		needs_self_rename = true;
 	} else {
@@ -211,10 +204,6 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 		source_workbook_xml = ReadEntryAsString(source, "xl/workbook.xml");
 		source_workbook_rels_xml = ReadEntryAsString(source, "xl/_rels/workbook.xml.rels");
 
-		if (!source.TryOpenEntry("xl/styles.xml")) {
-			throw IOException("Cannot append to '%s': xl/styles.xml is missing", source_path);
-		}
-		source.CloseEntry();
 		source_styles_xml = ReadEntryAsString(source, "xl/styles.xml");
 
 		if (!source.TryOpenEntry("xl/workbook.xml")) {
@@ -588,9 +577,9 @@ inline void XLSXAppender::EmitMetadata() {
 // MoveFile fail with ERROR_SHARING_VIOLATION. POSIX completes on the first attempt.
 template <typename F>
 static inline void RetryFsOp(F &&op) {
-	constexpr int MAX_ATTEMPTS = 40; // ~2s total
-	constexpr int SLEEP_MS = 50;
-	for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+	constexpr int32_t MAX_ATTEMPTS = 40; // ~2s total
+	constexpr int32_t SLEEP_MS = 50;
+	for (int32_t attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
 		try {
 			op();
 			return;

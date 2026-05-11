@@ -223,6 +223,18 @@ struct GlobalWriteXLSXData final : public GlobalFunctionData {
 
 	GlobalWriteXLSXData(ClientContext &context, const string &file_path, const WriteXLSXData &data) : executor(context) {
 
+		// MODE 'append'/'replace' reads the existing workbook and atomically swaps a rebuilt
+		// copy back into place via a sibling temp file + rename. Remote filesystems (s3://,
+		// https://, gcs://, azure://, ...) don't support that rename, so refuse up front
+		// rather than failing partway through after the original has been removed. Checked
+		// against the raw user path before ExpandPath so it fires even without httpfs loaded.
+		if ((data.append || data.replace) && FileSystem::IsRemoteFile(data.file_path)) {
+			throw NotImplementedException(
+			    "XLSX MODE '%s' is only supported for local files; '%s' is on a remote filesystem. "
+			    "Write the workbook to a local path and upload it instead.",
+			    data.replace ? "replace" : "append", data.file_path);
+		}
+
 		auto &fs = FileSystem::GetFileSystem(context);
 		// data.file_path is the user-typed path (may contain `~`); the framework hands us
 		// `file_path` as the temp it'll rename. Expand the user-typed path before checking.
