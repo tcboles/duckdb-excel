@@ -41,7 +41,15 @@ jobs:
     needs: duckdb-stable-build
     # Deploy on every push (any branch) and on manual dispatch. Skip PR builds since
     # they can't access secrets/permissions and would conflict with the head-branch run.
-    if: github.event_name != 'pull_request'
+    #
+    # `always()` so a non-essential platform failure in the build matrix
+    # (e.g. windows_amd64) doesn't skip the deploy — consumers only install
+    # the linux_*/osx_* binaries, so a Windows build break must not block
+    # publishing the platforms that did build. The "Verify required
+    # binaries present" step below still fails the deploy if any platform
+    # we actually serve is missing, so a fully-broken build can never wipe
+    # the live site.
+    if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -90,6 +98,32 @@ jobs:
             (cd public && find . -name '*.duckdb_extension.gz' | sort | sed 's|^\./|<li><a href="|; s|$|">|; s|$|</a></li>|')
             echo '</ul>'
           } > public/index.html
+
+      - name: Verify required binaries present
+        # Guard for the `always()` deploy: a Windows/wasm build break is
+        # tolerated, but if any platform we actually serve is missing for a
+        # required DuckDB version we must NOT publish — a partial upload
+        # would wipe those binaries off the live site. Fail loudly instead
+        # so the previous good deploy stays in place.
+        run: |
+          set -euo pipefail
+          required_versions="v1.4.4 v1.5.2"
+          required_archs="linux_amd64 linux_arm64 osx_amd64 osx_arm64"
+          missing=0
+          for version in $required_versions; do
+            for arch in $required_archs; do
+              path="public/${version}/${arch}/excel.duckdb_extension.gz"
+              if [ ! -s "$path" ]; then
+                echo "::error::missing required binary $path"
+                missing=1
+              fi
+            done
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Required binaries missing — refusing to publish a partial site."
+            exit 1
+          fi
+          echo "All required linux_*/osx_* binaries present for: ${required_versions}"
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
