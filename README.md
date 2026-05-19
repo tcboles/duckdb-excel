@@ -101,6 +101,7 @@ Notes:
 - `mode 'replace'` keeps the existing sheet's position, internal id, and file path stable, so external references in the workbook (charts, defined names, pivot caches) remain valid after the rewrite.
 - Appending into an xlsx authored by Excel, openpyxl, or another tool is supported: the existing workbook structure, styles, shared strings, and all unrelated sheets are preserved verbatim.
 - Use `mode 'append'` for adding sheets, `mode 'replace'` for overwriting one. Setting an invalid `mode` value raises an error at bind time.
+- `mode 'append'` and `mode 'replace'` only work for **local files**. They need to read the existing workbook and atomically swap a rebuilt copy back into place, which remote filesystems (`s3://`, `https://`, `gcs://`, `azure://`, …) don't support; using either against a remote path raises an error before the destination is touched. Write the workbook to a local path and upload it instead. (`mode 'create'` — the default — works with remote paths as usual, since it just writes a fresh file.)
 
 ## Type Conversions and Inference
 

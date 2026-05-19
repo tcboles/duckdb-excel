@@ -22,7 +22,7 @@ private:
 	void OnStartElement(const char *name, const char **atts) override;
 	void OnEndElement(const char *name) override;
 
-	enum class State { START, WORKBOOK, SHEETS, SHEET };
+	enum class State : uint8_t { START, WORKBOOK, SHEETS, SHEET };
 	State state = State::START;
 	vector<XLSXSheetEntry> sheets;
 };
