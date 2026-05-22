@@ -433,6 +433,21 @@ void ReadXLSX::ResolveSheet(const unique_ptr<XLSXReadData> &result, ZipFileReade
 	SniffHeader(result, archive);
 }
 
+// FileSystem::GlobFiles is 3-arg in DuckDB v1.4.x and 2-arg in v1.5.x; SFINAE-dispatch.
+namespace {
+template <typename FS>
+auto CallGlobFiles(FS &fs, const string &path, ClientContext &, int)
+    -> decltype(fs.GlobFiles(path, FileGlobOptions::ALLOW_EMPTY)) {
+	return fs.GlobFiles(path, FileGlobOptions::ALLOW_EMPTY);
+}
+
+template <typename FS>
+auto CallGlobFiles(FS &fs, const string &path, ClientContext &ctx, ...)
+    -> decltype(fs.GlobFiles(path, ctx, FileGlobOptions::ALLOW_EMPTY)) {
+	return fs.GlobFiles(path, ctx, FileGlobOptions::ALLOW_EMPTY);
+}
+} // namespace
+
 //-------------------------------------------------------------------
 // Bind
 //-------------------------------------------------------------------
@@ -444,7 +459,7 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindIn
 
 	// Glob here so that we auto load any required extension filesystems
 	auto &fs = FileSystem::GetFileSystem(context);
-	auto files = fs.GlobFiles(file_path, context, FileGlobOptions::ALLOW_EMPTY);
+	auto files = CallGlobFiles(fs, file_path, context, 0);
 	if (files.empty()) {
 		// Use our own error message to be less confusing
 		throw IOException("Cannot open file \"%s\": No such file or directory", file_path);
@@ -708,7 +723,9 @@ static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk 
 			TryCastFromString(gstate, options.ignore_errors, col_idx, context, target_col);
 		}
 	}
-	output.SetCapacity(row_count);
+	// SetCapacity removed in DuckDB v1.5+; SetCardinality alone suffices since `output`
+	// arrives from the framework with STANDARD_VECTOR_SIZE capacity, and row_count is
+	// bounded by that.
 	output.SetCardinality(row_count);
 
 	output.Verify();
