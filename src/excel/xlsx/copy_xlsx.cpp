@@ -415,7 +415,16 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	const auto row_count = input.size();
 	const auto col_count = input.data.size();
 
-	// First, cast the input columns to the target columns
+	// First, cast the input columns to the target columns.
+	// Reset() before every Execute: cast_chunk is a single GlobalWriteXLSXData
+	// member reused for every Sink chunk, and ExpressionExecutor::Execute does
+	// not reset its result. Without this, the per-column string heaps (populated
+	// by allocating casts such as DOUBLE->VARCHAR) accumulate across all chunks
+	// of the COPY; on wide, many-column sheets that buffer growth eventually
+	// causes later columns/chunks to be emitted as NULL, silently dropping cells.
+	// VARCHAR passthrough columns reference the input vector and so never showed
+	// the leak. Resetting reclaims those buffers each chunk.
+	state.cast_chunk.Reset();
 	state.executor.Execute(input, state.cast_chunk);
 
 	// Then, setup unified formats for the cast columns
